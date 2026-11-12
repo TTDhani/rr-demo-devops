@@ -14,11 +14,11 @@ if [[ -z "$AMI_ID" && -f "${ROOT_DIR}/artifacts/latest-ami-id.txt" ]]; then
 fi
 
 [[ -n "$AMI_ID" && "$AMI_ID" != "None" ]] || {
-    echo "ERROR: AMI_ID is missing. Create an AMI first." >&2
+    echo "ERROR: AMI_ID is missing. Create or provide an AMI first." >&2
     exit 1
 }
 
-# Validate the AMI.
+# Validate AMI availability.
 ami_state="$("${AWS[@]}" ec2 describe-images \
     --image-ids "$AMI_ID" \
     --query 'Images[0].State' \
@@ -42,7 +42,7 @@ asg_count="$(jq '.AutoScalingGroups | length' <<< "$asg_json")"
 }
 
 asg_lt_id="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId // empty' <<< "$asg_json")"
-source_version="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' <<< "$asg_json")"
+asg_version="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' <<< "$asg_json")"
 
 [[ "$asg_lt_id" == "$LAUNCH_TEMPLATE_ID" ]] || {
     echo "ERROR: ASG Launch Template mismatch."
@@ -51,14 +51,27 @@ source_version="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' 
     exit 1
 }
 
-# Require a concrete numeric version to avoid inheriting a moving alias.
+# Resolve symbolic versions such as $Default to a numeric version.
+if [[ "$asg_version" == '$Default' || "$asg_version" == '$Latest' ]]; then
+    echo "ASG uses symbolic Launch Template version: $asg_version"
+
+    source_version="$("${AWS[@]}" ec2 describe-launch-template-versions \
+        --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+        --versions "$asg_version" \
+        --query 'LaunchTemplateVersions[0].VersionNumber' \
+        --output text)"
+else
+    source_version="$asg_version"
+fi
+
 [[ "$source_version" =~ ^[0-9]+$ ]] || {
-    echo "ERROR: ASG Launch Template version is not numeric: $source_version" >&2
-    echo "Resolve the ASG version to a numeric version before continuing." >&2
+    echo "ERROR: Could not resolve ASG Launch Template version: $asg_version" >&2
     exit 1
 }
 
-# Retrieve the exact version currently used by the ASG.
+echo "Resolved source Launch Template version: $source_version"
+
+# Retrieve the exact numeric version currently represented by the ASG.
 mkdir -p "${ROOT_DIR}/artifacts"
 
 data="${ROOT_DIR}/artifacts/lt-data.json"
@@ -83,7 +96,8 @@ echo "LAUNCH TEMPLATE VERSION PLAN"
 echo "========================================"
 echo "ASG:                 $ASG_NAME"
 echo "Launch Template:     $LAUNCH_TEMPLATE_ID"
-echo "Source LT version:   $source_version"
+echo "ASG configured version: $asg_version"
+echo "Resolved source version: $source_version"
 echo "New AMI:             $AMI_ID"
 echo
 echo "Inherited Launch Template settings:"

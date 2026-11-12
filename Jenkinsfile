@@ -5,7 +5,7 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
-        timeout(time: 90, unit: 'MINUTES')
+        timeout(time: 120, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '30'))
     }
 
@@ -18,9 +18,10 @@ pipeline {
                 'CREATE_LT_VERSION',
                 'UPDATE_ASG',
                 'START_REFRESH',
-                'VERIFY_REFRESH'
+                'VERIFY_REFRESH',
+                'FULL_ROLLOUT'
             ],
-            description: 'Run one infrastructure operation at a time.'
+            description: 'Select an infrastructure operation.'
         )
 
         booleanParam(
@@ -69,6 +70,23 @@ pipeline {
             }
         }
 
+        stage('Approve Full Infrastructure Rollout') {
+            when {
+                expression {
+                    params.ACTION == 'FULL_ROLLOUT' && params.APPLY
+                }
+            }
+
+            steps {
+                timeout(time: 15, unit: 'MINUTES') {
+                    input(
+                        message: 'Application deployment succeeded. Approve AMI creation from Demand-a2, Launch Template update and ASG Instance Refresh?',
+                        ok: 'Approve Infrastructure Rollout'
+                    )
+                }
+            }
+        }
+
         stage('Infrastructure Operation') {
             steps {
                 withCredentials([
@@ -90,7 +108,6 @@ pipeline {
                             echo "RR-DEMO INFRASTRUCTURE AUTOMATION"
                             echo "===================================="
 
-                            # Load Jenkins Secret File configuration.
                             export CONFIG_FILE="$POC_ENV_FILE"
 
                             echo "Selected Action: ${ACTION}"
@@ -108,7 +125,6 @@ pipeline {
                             echo "RUNNING AWS PREFLIGHT"
                             echo "===================================="
 
-                            # Always run preflight before an operation.
                             ./scripts/01-preflight.sh
 
                             if [ "${ACTION}" = "PREFLIGHT" ]; then
@@ -146,6 +162,47 @@ pipeline {
                                 VERIFY_REFRESH)
                                     echo "Verifying Instance Refresh..."
                                     ./scripts/06-verify-refresh.sh
+                                    ;;
+
+                                FULL_ROLLOUT)
+                                    if [ "${APPLY}" != "true" ]; then
+                                        echo "ERROR: FULL_ROLLOUT requires APPLY=true."
+                                        exit 1
+                                    fi
+
+                                    echo "===================================="
+                                    echo "STEP 1: CREATE AMI"
+                                    echo "===================================="
+
+                                    ./scripts/02-create-ami.sh
+
+                                    echo "===================================="
+                                    echo "STEP 2: CREATE LAUNCH TEMPLATE VERSION"
+                                    echo "===================================="
+
+                                    ./scripts/03-create-lt-version.sh
+
+                                    echo "===================================="
+                                    echo "STEP 3: UPDATE AUTO SCALING GROUP"
+                                    echo "===================================="
+
+                                    ./scripts/04-update-asg.sh
+
+                                    echo "===================================="
+                                    echo "STEP 4: START INSTANCE REFRESH"
+                                    echo "===================================="
+
+                                    ./scripts/05-start-instance-refresh.sh
+
+                                    echo "===================================="
+                                    echo "STEP 5: VERIFY INSTANCE REFRESH"
+                                    echo "===================================="
+
+                                    ./scripts/06-verify-refresh.sh
+
+                                    echo "===================================="
+                                    echo "FULL ROLLOUT COMPLETED"
+                                    echo "===================================="
                                     ;;
 
                                 *)

@@ -1,0 +1,5 @@
+config/poc.env
+artifacts/
+*.log
+*.tmp
+.DS_Store

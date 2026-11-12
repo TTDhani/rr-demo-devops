@@ -1,46 +1,176 @@
+
 pipeline {
     agent any
+
     options {
-        disableConcurrentBuilds()
         timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '30'))
     }
+
     parameters {
-        choice(name: 'ACTION', choices: ['PREFLIGHT', 'CREATE_AMI', 'CREATE_LT_VERSION', 'UPDATE_ASG', 'START_REFRESH', 'VERIFY_REFRESH'], description: 'Run one operation at a time')
-        booleanParam(name: 'APPLY', defaultValue: false, description: 'Execute a mutating operation; false means dry-run')
+        choice(
+            name: 'ACTION',
+            choices: [
+                'PREFLIGHT',
+                'CREATE_AMI',
+                'CREATE_LT_VERSION',
+                'UPDATE_ASG',
+                'START_REFRESH',
+                'VERIFY_REFRESH'
+            ],
+            description: 'Run one infrastructure operation at a time.'
+        )
+
+        booleanParam(
+            name: 'APPLY',
+            defaultValue: false,
+            description: 'Enable AWS changes. Keep unchecked for dry-run.'
+        )
     }
-    environment { AWS_DEFAULT_REGION = 'ap-south-1' }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+    }
+
     stages {
-        stage('Checkout') { steps { checkout scm } }
-        stage('Preflight') {
+
+        stage('Checkout') {
             steps {
-                sh """
-                    set -e
-                    test -f config/poc.env || { echo 'Create config/poc.env from config/poc.env.example'; exit 1; }
-                    chmod +x scripts/*.sh
-                    ./scripts/01-preflight.sh
-                """
+                checkout scm
             }
         }
-        stage('Selected operation') {
+
+        stage('Validate Tools') {
             steps {
-                sh """
-                    set -e
-                    export APPLY='${params.APPLY}'
-                    case '${params.ACTION}' in
-                      PREFLIGHT) ./scripts/01-preflight.sh ;;
-                      CREATE_AMI) ./scripts/02-create-ami.sh ;;
-                      CREATE_LT_VERSION) ./scripts/03-create-lt-version.sh ;;
-                      UPDATE_ASG) ./scripts/04-update-asg.sh ;;
-                      START_REFRESH) ./scripts/05-start-instance-refresh.sh ;;
-                      VERIFY_REFRESH) ./scripts/06-verify-refresh.sh ;;
-                      *) echo 'Unsupported action'; exit 2 ;;
-                    esac
-                """
+                sh '''
+                    set -eu
+
+                    echo "Checking required tools..."
+
+                    command -v aws
+                    command -v jq
+                    command -v bash
+
+                    echo "AWS CLI version:"
+                    aws --version
+
+                    echo "JQ version:"
+                    jq --version
+
+                    echo "Git revision:"
+                    git rev-parse --short HEAD
+
+                    chmod +x scripts/*.sh
+                '''
+            }
+        }
+
+        stage('Infrastructure Operation') {
+            steps {
+                script {
+                    withCredentials([
+                        file(
+                            credentialsId: 'rr-demo-poc-env',
+                            variable: 'POC_ENV_FILE'
+                        )
+                    ]) {
+
+                        withEnv([
+                            "CONFIG_FILE=${env.POC_ENV_FILE}",
+                            "ACTION=${params.ACTION}",
+                            "APPLY=${params.APPLY}"
+                        ]) {
+
+                            sh '''
+                                set -eu
+
+                                echo "===================================="
+                                echo "RR-DEMO INFRASTRUCTURE AUTOMATION"
+                                echo "===================================="
+
+                                echo "Selected Action: ${ACTION}"
+                                echo "Apply Enabled: ${APPLY}"
+                                echo "AWS Region: ${AWS_DEFAULT_REGION}"
+
+                                echo "Running read-only preflight..."
+
+                                ./scripts/01-preflight.sh
+
+                                if [ "${ACTION}" = "PREFLIGHT" ]; then
+                                    echo "Preflight completed."
+                                    echo "No infrastructure changes requested."
+                                    exit 0
+                                fi
+
+                                case "${ACTION}" in
+
+                                    CREATE_AMI)
+                                        echo "Starting AMI creation..."
+                                        ./scripts/02-create-ami.sh
+                                        ;;
+
+                                    CREATE_LT_VERSION)
+                                        echo "Creating Launch Template version..."
+                                        ./scripts/03-create-lt-version.sh
+                                        ;;
+
+                                    UPDATE_ASG)
+                                        echo "Updating Auto Scaling Group..."
+                                        ./scripts/04-update-asg.sh
+                                        ;;
+
+                                    START_REFRESH)
+                                        echo "Starting Instance Refresh..."
+                                        ./scripts/05-start-instance-refresh.sh
+                                        ;;
+
+                                    VERIFY_REFRESH)
+                                        echo "Verifying Instance Refresh..."
+                                        ./scripts/06-verify-refresh.sh
+                                        ;;
+
+                                    *)
+                                        echo "Unsupported action: ${ACTION}"
+                                        exit 2
+                                        ;;
+
+                                esac
+                            '''
+                        }
+                    }
+                }
             }
         }
     }
+
     post {
-        always { archiveArtifacts artifacts: 'artifacts/**', allowEmptyArchive: true }
+
+        success {
+            echo 'Infrastructure pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Infrastructure pipeline failed. Review console output before retrying.'
+        }
+
+        always {
+
+            archiveArtifacts(
+                artifacts: 'artifacts/**',
+                allowEmptyArchive: true
+            )
+
+            echo 'Cleaning infrastructure workspace...'
+
+            cleanWs(
+                deleteDirs: true,
+                disableDeferredWipeout: true,
+                notFailBuild: true
+            )
+
+            echo 'Infrastructure pipeline execution finished.'
+        }
     }
 }

@@ -13,7 +13,6 @@ require_value LAUNCH_TEMPLATE_ID
 : "${SKIP_MATCHING:=true}"
 : "${AUTO_ROLLBACK:=true}"
 
-# Validate numeric settings.
 for value in "$MIN_HEALTHY_PERCENTAGE" "$MAX_HEALTHY_PERCENTAGE" "$INSTANCE_WARMUP_SECONDS"; do
     [[ "$value" =~ ^[0-9]+$ ]] || {
         echo "ERROR: Invalid numeric refresh preference: $value" >&2
@@ -46,7 +45,7 @@ done
     exit 1
 }
 
-# Confirm the ASG is using the intended LT version.
+# Read the intended LT version.
 expected_version="${NEW_LT_VERSION:-}"
 
 if [[ -z "$expected_version" && -f "${ROOT_DIR}/artifacts/latest-lt-version.txt" ]]; then
@@ -58,6 +57,7 @@ fi
     exit 1
 }
 
+# Validate the ASG configuration.
 asg_json="$("${AWS[@]}" autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG_NAME" \
     --output json)"
@@ -88,6 +88,13 @@ health_type="$(jq -r '.AutoScalingGroups[0].HealthCheckType' <<< "$asg_json")"
     exit 1
 }
 
+# Verify the intended LT version exists.
+"${AWS[@]}" ec2 describe-launch-template-versions \
+    --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+    --versions "$expected_version" \
+    --query 'LaunchTemplateVersions[0].VersionNumber' \
+    --output text >/dev/null
+
 # Refuse to start a second active refresh.
 active_refreshes="$("${AWS[@]}" autoscaling describe-instance-refreshes \
     --auto-scaling-group-name "$ASG_NAME" \
@@ -98,6 +105,21 @@ active_refreshes="$("${AWS[@]}" autoscaling describe-instance-refreshes \
     echo "ERROR: An Instance Refresh is already active for $ASG_NAME." >&2
     exit 1
 }
+
+mkdir -p "${ROOT_DIR}/artifacts"
+
+# Desired configuration is explicitly supplied for AutoRollback support.
+desired_file="${ROOT_DIR}/artifacts/desired-configuration.json"
+
+jq -n \
+    --arg id "$LAUNCH_TEMPLATE_ID" \
+    --arg version "$expected_version" \
+    '{
+        LaunchTemplate: {
+            LaunchTemplateId: $id,
+            Version: $version
+        }
+    }' > "$desired_file"
 
 prefs="$(jq -n \
     --argjson min "$MIN_HEALTHY_PERCENTAGE" \
@@ -120,8 +142,13 @@ echo "ASG:                   $ASG_NAME"
 echo "Launch Template:       $LAUNCH_TEMPLATE_ID"
 echo "LT version:            $expected_version"
 echo "Health check:          $health_type"
+echo "Auto rollback:         $AUTO_ROLLBACK"
 echo
-echo "$prefs" | jq .
+echo "Desired configuration:"
+jq . "$desired_file"
+echo
+echo "Refresh preferences:"
+jq . <<< "$prefs"
 echo
 echo "WARNING: This operation replaces ASG instances."
 
@@ -129,6 +156,7 @@ confirm_apply || exit 0
 
 refresh_id="$("${AWS[@]}" autoscaling start-instance-refresh \
     --auto-scaling-group-name "$ASG_NAME" \
+    --desired-configuration "file://${desired_file}" \
     --preferences "$prefs" \
     --query InstanceRefreshId \
     --output text)"
@@ -137,8 +165,6 @@ refresh_id="$("${AWS[@]}" autoscaling start-instance-refresh \
     echo "ERROR: AWS did not return an Instance Refresh ID." >&2
     exit 1
 }
-
-mkdir -p "${ROOT_DIR}/artifacts"
 
 printf '%s\n' "$refresh_id" > "${ROOT_DIR}/artifacts/latest-refresh-id.txt"
 printf '%s\n' "$expected_version" > "${ROOT_DIR}/artifacts/refresh-lt-version.txt"

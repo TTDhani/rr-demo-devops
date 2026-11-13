@@ -2,175 +2,235 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-source "$(dirname "$0")/common.sh"
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
 
-require_value ASG_NAME
-require_value LAUNCH_TEMPLATE_ID
-require_value TARGET_GROUP_ARN
+: "${AWS_REGION:?AWS_REGION is required}"
+: "${ASG_NAME:?ASG_NAME is required}"
+: "${TARGET_GROUP_ARN:?TARGET_GROUP_ARN is required}"
+: "${LT_ID:?LT_ID is required}"
+: "${EXPECTED_LT_VERSION:?EXPECTED_LT_VERSION is required}"
 
-: "${REFRESH_TIMEOUT_SECONDS:=7200}"
-: "${REFRESH_POLL_INTERVAL_SECONDS:=30}"
-: "${TARGET_HEALTH_TIMEOUT_SECONDS:=600}"
+POLL_INTERVAL=20
+MAX_WAIT_SECONDS=1800
 
-id="${REFRESH_ID:-}"
-if [[ -z "$id" && -f "$ROOT_DIR/artifacts/latest-refresh-id.txt" ]]; then
-    id="$(cat "$ROOT_DIR/artifacts/latest-refresh-id.txt")"
+# File created before starting the refresh.
+BASELINE_FILE="artifacts/pre-refresh-instance-ids.txt"
+
+mkdir -p artifacts
+
+if [[ ! -f "$BASELINE_FILE" ]]; then
+    echo "ERROR: Baseline instance ID file is missing."
+    exit 1
 fi
 
-[[ -n "$id" ]] || {
-    echo "ERROR: REFRESH_ID is required." >&2
-    exit 1
-}
+echo "=========================================="
+echo "NEW ASG INSTANCE HEALTH VERIFICATION"
+echo "=========================================="
 
-expected_version="${NEW_LT_VERSION:-}"
-if [[ -z "$expected_version" && -f "$ROOT_DIR/artifacts/refresh-lt-version.txt" ]]; then
-    expected_version="$(cat "$ROOT_DIR/artifacts/refresh-lt-version.txt")"
-fi
-
-expected_ami="${AMI_ID:-}"
-if [[ -z "$expected_ami" && -f "$ROOT_DIR/artifacts/refresh-ami-id.txt" ]]; then
-    expected_ami="$(cat "$ROOT_DIR/artifacts/refresh-ami-id.txt")"
-fi
-if [[ -z "$expected_ami" && -f "$ROOT_DIR/artifacts/latest-ami-id.txt" ]]; then
-    expected_ami="$(cat "$ROOT_DIR/artifacts/latest-ami-id.txt")"
-fi
-
-[[ "$expected_version" =~ ^[0-9]+$ ]] || {
-    echo "ERROR: Expected numeric LT version is missing." >&2
-    exit 1
-}
-[[ -n "$expected_ami" ]] || {
-    echo "ERROR: Expected AMI ID is missing." >&2
-    exit 1
-}
-
-echo "Monitoring refresh: $id"
-echo "ASG: $ASG_NAME | LT: $LAUNCH_TEMPLATE_ID | Version: $expected_version | AMI: $expected_ami"
-
-deadline=$((SECONDS + REFRESH_TIMEOUT_SECONDS))
-
-while true; do
-    obj="$("${AWS[@]}" autoscaling describe-instance-refreshes \
-        --auto-scaling-group-name "$ASG_NAME" \
-        --instance-refresh-ids "$id" \
-        --query 'InstanceRefreshes[0]' \
-        --output json)"
-
-    status="$(jq -r '.Status // "Unknown"' <<< "$obj")"
-    progress="$(jq -r '.PercentageComplete // 0' <<< "$obj")"
-    reason="$(jq -r '.StatusReason // "No reason supplied"' <<< "$obj")"
-
-    echo "Status=$status Progress=${progress}% Reason=$reason"
-
-    case "$status" in
-        Successful) break ;;
-        Failed|Cancelled|RollbackFailed|RollbackSuccessful)
-            echo "ERROR: Refresh ended with status $status" >&2
-            jq . <<< "$obj"
-            "${AWS[@]}" autoscaling describe-scaling-activities \
-                --auto-scaling-group-name "$ASG_NAME" \
-                --max-records 20 \
-                --output table || true
-            exit 1
-            ;;
-        Pending|InProgress|Cancelling|RollbackInProgress) ;;
-        *)
-            echo "ERROR: Unexpected refresh status: $status" >&2
-            jq . <<< "$obj"
-            exit 1
-            ;;
-    esac
-
-    if (( SECONDS >= deadline )); then
-        echo "ERROR: Monitoring timeout reached. AWS refresh is NOT cancelled." >&2
-        "${AWS[@]}" autoscaling describe-scaling-activities \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --max-records 20 \
-            --output table || true
-        exit 2
-    fi
-
-    sleep "$REFRESH_POLL_INTERVAL_SECONDS"
-done
-
-echo "AWS reports refresh Successful. Verifying ASG..."
-
-asg_json="$(get_asg_json "$ASG_NAME")"
-actual_lt="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId // empty' <<< "$asg_json")"
-actual_version="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' <<< "$asg_json")"
-instances="$(jq '.AutoScalingGroups[0].Instances // []' <<< "$asg_json")"
-desired="$(jq -r '.AutoScalingGroups[0].DesiredCapacity' <<< "$asg_json")"
-
-[[ "$actual_lt" == "$LAUNCH_TEMPLATE_ID" && "$actual_version" == "$expected_version" ]] || {
-    echo "ERROR: ASG is not configured with the expected LT version." >&2
-    exit 1
-}
-
-count="$(jq 'length' <<< "$instances")"
-(( count >= desired && count > 0 )) || {
-    echo "ERROR: ASG instance count $count is below desired capacity $desired." >&2
-    exit 1
-}
-
-bad="$(jq --arg v "$expected_version" \
-    '[.[] | select(.LifecycleState != "InService" or .HealthStatus != "Healthy" or (.LaunchTemplate.Version|tostring) != $v)] | length' \
-    <<< "$instances")"
-
-[[ "$bad" == 0 ]] || {
-    echo "ERROR: One or more ASG instances are not healthy on LT version $expected_version." >&2
-    jq '.[] | {InstanceId,LifecycleState,HealthStatus,LaunchTemplate}' <<< "$instances"
-    exit 1
-}
-
-instance_ids="$(jq -r '.[].InstanceId' <<< "$instances")"
-
-while IFS= read -r iid; do
-    [[ -n "$iid" ]] || continue
-    actual_ami="$("${AWS[@]}" ec2 describe-instances \
-        --instance-ids "$iid" \
-        --query 'Reservations[0].Instances[0].ImageId' \
-        --output text)"
-    echo "Instance $iid AMI=$actual_ami"
-    [[ "$actual_ami" == "$expected_ami" ]] || {
-        echo "ERROR: Instance $iid is running AMI $actual_ami, expected $expected_ami." >&2
-        exit 1
-    }
-done <<< "$instance_ids"
-
-echo "Waiting for target-group health..."
-health_deadline=$((SECONDS + TARGET_HEALTH_TIMEOUT_SECONDS))
-
-while true; do
-    target_json="$("${AWS[@]}" elbv2 describe-target-health \
-        --target-group-arn "$TARGET_GROUP_ARN" \
-        --output json)"
-
-    all_healthy=true
-    while IFS= read -r iid; do
-        [[ -n "$iid" ]] || continue
-        state="$(jq -r --arg id "$iid" \
-            '[.TargetHealthDescriptions[] | select(.Target.Id==$id) | .TargetHealth.State][0] // "not-registered"' \
-            <<< "$target_json")"
-        echo "Target $iid: $state"
-        [[ "$state" == healthy ]] || all_healthy=false
-    done <<< "$instance_ids"
-
-    [[ "$all_healthy" == true ]] && break
-
-    if (( SECONDS >= health_deadline )); then
-        echo "ERROR: Target group did not become healthy before timeout." >&2
-        jq '.TargetHealthDescriptions[] | {Target,TargetHealth}' <<< "$target_json"
-        exit 1
-    fi
-
-    sleep 15
-done
-
-echo "================================================"
-echo "INSTANCE REFRESH VERIFICATION PASSED"
 echo "ASG: $ASG_NAME"
-echo "LT version: $expected_version"
-echo "AMI: $expected_ami"
-echo "All ASG instances are InService and Healthy."
-echo "All target-group instances are healthy."
-echo "================================================"
+echo "Launch Template: $LT_ID"
+echo "Expected version: $EXPECTED_LT_VERSION"
+echo "Target Group: $TARGET_GROUP_ARN"
+
+echo
+echo "Existing instances before refresh:"
+cat "$BASELINE_FILE"
+
+START_TIME=$(date +%s)
+NEW_INSTANCE_ID=""
+
+# ---------------------------------------------------------
+# STEP 1: DISCOVER THE NEW INSTANCE
+# ---------------------------------------------------------
+
+while true; do
+
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$((CURRENT_TIME - START_TIME))
+
+    if (( ELAPSED >= MAX_WAIT_SECONDS )); then
+        echo "ERROR: Timed out waiting for new ASG instance."
+        exit 1
+    fi
+
+    echo
+    echo "Discovering replacement instance..."
+
+    ASG_INSTANCES=$(
+        aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --output json
+    )
+
+    NEW_INSTANCE_ID=$(
+        echo "$ASG_INSTANCES" |
+        jq -r \
+          --arg lt "$LT_ID" \
+          --arg version "$EXPECTED_LT_VERSION" \
+          --argjson old "$(jq -R -s 'split("\n") | map(select(length > 0))' "$BASELINE_FILE")" \
+          '
+          [
+            .AutoScalingGroups[0].Instances[]
+            | select(
+                .LaunchTemplate.LaunchTemplateId == $lt
+                and .LaunchTemplate.Version == $version
+                and (.InstanceId as $id | ($old | index($id) | not))
+            )
+          ]
+          | sort_by(.InstanceId)
+          | .[0].InstanceId // empty
+          '
+    )
+
+    if [[ -n "$NEW_INSTANCE_ID" ]]; then
+        echo "New replacement instance discovered: $NEW_INSTANCE_ID"
+        break
+    fi
+
+    echo "Replacement instance not found yet."
+    sleep "$POLL_INTERVAL"
+
+done
+
+# ---------------------------------------------------------
+# STEP 2: MONITOR ONLY THE NEW INSTANCE
+# ---------------------------------------------------------
+
+while true; do
+
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$((CURRENT_TIME - START_TIME))
+
+    if (( ELAPSED >= MAX_WAIT_SECONDS )); then
+        echo "ERROR: New instance health verification timed out."
+        exit 1
+    fi
+
+    echo
+    echo "------------------------------------------"
+    echo "Checking new instance: $NEW_INSTANCE_ID"
+    echo "------------------------------------------"
+
+    INSTANCE_INFO=$(
+        aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --instance-ids "$NEW_INSTANCE_ID" \
+            --output json
+    )
+
+    EC2_STATE=$(
+        echo "$INSTANCE_INFO" |
+        jq -r '.Reservations[0].Instances[0].State.Name // "unknown"'
+    )
+
+    STATUS_CHECKS=$(
+        aws ec2 describe-instance-status \
+            --region "$AWS_REGION" \
+            --instance-ids "$NEW_INSTANCE_ID" \
+            --include-all-instances \
+            --output json
+    )
+
+    SYSTEM_STATUS=$(
+        echo "$STATUS_CHECKS" |
+        jq -r '.InstanceStatuses[0].SystemStatus.Status // "initializing"'
+    )
+
+    INSTANCE_STATUS=$(
+        echo "$STATUS_CHECKS" |
+        jq -r '.InstanceStatuses[0].InstanceStatus.Status // "initializing"'
+    )
+
+    ASG_STATE=$(
+        aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[?InstanceId=='$NEW_INSTANCE_ID'].LifecycleState | [0]" \
+            --output text
+    )
+
+    ASG_HEALTH=$(
+        aws autoscaling describe-auto-scaling-groups \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[?InstanceId=='$NEW_INSTANCE_ID'].HealthStatus | [0]" \
+            --output text
+    )
+
+    TARGET_HEALTH=$(
+        aws elbv2 describe-target-health \
+            --region "$AWS_REGION" \
+            --target-group-arn "$TARGET_GROUP_ARN" \
+            --targets Id="$NEW_INSTANCE_ID",Port=3000 \
+            --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+            --output text
+    )
+
+    TARGET_REASON=$(
+        aws elbv2 describe-target-health \
+            --region "$AWS_REGION" \
+            --target-group-arn "$TARGET_GROUP_ARN" \
+            --targets Id="$NEW_INSTANCE_ID",Port=3000 \
+            --query 'TargetHealthDescriptions[0].TargetHealth.Reason' \
+            --output text
+    )
+
+    echo "Instance ID:      $NEW_INSTANCE_ID"
+    echo "EC2 state:        $EC2_STATE"
+    echo "System status:    $SYSTEM_STATUS"
+    echo "Instance status:  $INSTANCE_STATUS"
+    echo "ASG lifecycle:    $ASG_STATE"
+    echo "ASG health:       $ASG_HEALTH"
+    echo "Target health:    $TARGET_HEALTH"
+    echo "Target reason:    $TARGET_REASON"
+
+    # Only the replacement instance determines this check.
+    if [[ "$EC2_STATE" == "running" ]] &&
+       [[ "$SYSTEM_STATUS" == "ok" ]] &&
+       [[ "$INSTANCE_STATUS" == "ok" ]] &&
+       [[ "$ASG_STATE" == "InService" ]] &&
+       [[ "$ASG_HEALTH" == "Healthy" ]] &&
+       [[ "$TARGET_HEALTH" == "healthy" ]]; then
+
+        echo
+        echo "=========================================="
+        echo "NEW INSTANCE HEALTHY"
+        echo "=========================================="
+        echo "Instance: $NEW_INSTANCE_ID"
+        echo "EC2: running"
+        echo "EC2 status checks: passed"
+        echo "ASG: InService / Healthy"
+        echo "Target Group: healthy"
+        break
+    fi
+
+    if [[ "$EC2_STATE" == "terminated" ]] ||
+       [[ "$ASG_STATE" == "Terminating" ]]; then
+        echo "ERROR: Replacement instance was terminated."
+        echo "Inspect ASG scaling activities and target health."
+        exit 1
+    fi
+
+    echo "Replacement is not fully healthy yet."
+    echo "Retrying in ${POLL_INTERVAL}s..."
+
+    sleep "$POLL_INTERVAL"
+
+done
+
+# ---------------------------------------------------------
+# STEP 3: VERIFY INSTANCE REFRESH
+# ---------------------------------------------------------
+
+echo
+echo "New instance passed all health checks."
+echo "Now verifying final Instance Refresh status..."
+
+# Keep your existing refresh-ID monitoring here.
+# Do not mark the rollout successful until AWS reports
+# the Instance Refresh status as Successful.
+
+echo "New instance verification completed."

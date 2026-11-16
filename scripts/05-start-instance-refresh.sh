@@ -1,15 +1,14 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-source "$(dirname "$0")/common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 require_value ASG_NAME
 require_value LAUNCH_TEMPLATE_ID
 
 : "${MIN_HEALTHY_PERCENTAGE:=90}"
 : "${MAX_HEALTHY_PERCENTAGE:=190}"
-: "${INSTANCE_WARMUP_SECONDS:=300}"
+: "${INSTANCE_WARMUP_SECONDS:=600}"
 : "${SKIP_MATCHING:=true}"
 : "${AUTO_ROLLBACK:=true}"
 
@@ -24,36 +23,31 @@ done
     echo "ERROR: MIN_HEALTHY_PERCENTAGE must be <= 100." >&2
     exit 1
 }
-
 (( MAX_HEALTHY_PERCENTAGE >= 100 && MAX_HEALTHY_PERCENTAGE <= 200 )) || {
     echo "ERROR: MAX_HEALTHY_PERCENTAGE must be between 100 and 200." >&2
     exit 1
 }
-
 (( MAX_HEALTHY_PERCENTAGE >= MIN_HEALTHY_PERCENTAGE )) || {
-    echo "ERROR: Maximum must be >= minimum." >&2
+    echo "ERROR: MAX_HEALTHY_PERCENTAGE must be >= MIN_HEALTHY_PERCENTAGE." >&2
     exit 1
 }
-
 (( MAX_HEALTHY_PERCENTAGE - MIN_HEALTHY_PERCENTAGE <= 100 )) || {
     echo "ERROR: AWS requires MAX - MIN to be <= 100." >&2
     exit 1
 }
 
-[[ "$SKIP_MATCHING" == true || "$SKIP_MATCHING" == false ]] || {
+[[ "$SKIP_MATCHING" == "true" || "$SKIP_MATCHING" == "false" ]] || {
     echo "ERROR: SKIP_MATCHING must be true or false." >&2
     exit 1
 }
-
-[[ "$AUTO_ROLLBACK" == true || "$AUTO_ROLLBACK" == false ]] || {
+[[ "$AUTO_ROLLBACK" == "true" || "$AUTO_ROLLBACK" == "false" ]] || {
     echo "ERROR: AUTO_ROLLBACK must be true or false." >&2
     exit 1
 }
 
 expected_version="${NEW_LT_VERSION:-}"
-
 if [[ -z "$expected_version" && -f "$ROOT_DIR/artifacts/latest-lt-version.txt" ]]; then
-    expected_version="$(cat "$ROOT_DIR/artifacts/latest-lt-version.txt")"
+    expected_version="$(tr -d '[:space:]' < "$ROOT_DIR/artifacts/latest-lt-version.txt")"
 fi
 
 [[ "$expected_version" =~ ^[0-9]+$ ]] || {
@@ -79,14 +73,14 @@ ami_state="$("${AWS[@]}" ec2 describe-images \
     --query 'Images[0].State' \
     --output text)"
 
-[[ "$ami_state" == available ]] || {
+[[ "$ami_state" == "available" ]] || {
     echo "ERROR: AMI $expected_ami is not available: $ami_state" >&2
     exit 1
 }
 
 asg_json="$(get_asg_json "$ASG_NAME")"
 
-[[ "$(jq '.AutoScalingGroups | length' <<< "$asg_json")" == 1 ]] || {
+[[ "$(jq '.AutoScalingGroups | length' <<< "$asg_json")" == "1" ]] || {
     echo "ERROR: ASG not found or ambiguous." >&2
     exit 1
 }
@@ -94,19 +88,22 @@ asg_json="$(get_asg_json "$ASG_NAME")"
 actual_lt_id="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId // empty' <<< "$asg_json")"
 actual_version="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' <<< "$asg_json")"
 health_type="$(jq -r '.AutoScalingGroups[0].HealthCheckType // empty' <<< "$asg_json")"
+grace="$(jq -r '.AutoScalingGroups[0].HealthCheckGracePeriod // empty' <<< "$asg_json")"
 
 [[ "$actual_lt_id" == "$LAUNCH_TEMPLATE_ID" ]] || {
     echo "ERROR: ASG Launch Template mismatch." >&2
     exit 1
 }
-
 [[ "$actual_version" == "$expected_version" ]] || {
-    echo "ERROR: ASG version $actual_version != expected $expected_version." >&2
+    echo "ERROR: ASG LT version is $actual_version; expected $expected_version." >&2
     exit 1
 }
-
-[[ "$health_type" == ELB ]] || {
-    echo "ERROR: ASG health check must be ELB." >&2
+[[ "$health_type" == "ELB" ]] || {
+    echo "ERROR: ASG health-check type must be ELB." >&2
+    exit 1
+}
+(( grace >= 600 )) || {
+    echo "ERROR: ASG health-check grace period is below 600 seconds: $grace" >&2
     exit 1
 }
 
@@ -115,13 +112,13 @@ active_count="$("${AWS[@]}" autoscaling describe-instance-refreshes \
     --query "length(InstanceRefreshes[?Status=='Pending' || Status=='InProgress' || Status=='Cancelling' || Status=='RollbackInProgress'])" \
     --output text)"
 
-[[ "$active_count" == 0 ]] || {
+[[ "$active_count" == "0" ]] || {
     echo "ERROR: An Instance Refresh is already active. Do not start another." >&2
     exit 1
 }
 
-mkdir -p "$ROOT_DIR/artifacts"
-desired_file="$ROOT_DIR/artifacts/desired-configuration.json"
+ARTIFACT_DIR="$(artifact_dir)"
+desired_file="$ARTIFACT_DIR/desired-configuration.json"
 
 jq -n \
     --arg id "$LAUNCH_TEMPLATE_ID" \
@@ -143,12 +140,18 @@ prefs="$(jq -n \
         AutoRollback:$rollback
     }')"
 
-echo "ASG: $ASG_NAME"
-echo "LT: $LAUNCH_TEMPLATE_ID"
-echo "LT version: $expected_version"
-echo "AMI: $expected_ami"
-echo "Refresh preferences:"
-jq . <<< "$prefs"
+echo
+echo "=============== INSTANCE REFRESH PLAN ==============="
+echo "ASG                  : $ASG_NAME"
+echo "Launch Template      : $LAUNCH_TEMPLATE_ID"
+echo "LT version           : $expected_version"
+echo "AMI                  : $expected_ami"
+echo "Min healthy          : $MIN_HEALTHY_PERCENTAGE%"
+echo "Max healthy          : $MAX_HEALTHY_PERCENTAGE%"
+echo "Instance warmup      : $INSTANCE_WARMUP_SECONDS seconds"
+echo "Auto rollback        : $AUTO_ROLLBACK"
+echo "Health grace period  : $grace seconds"
+echo "====================================================="
 echo "This operation replaces ASG instances."
 
 confirm_apply || exit 0
@@ -160,13 +163,15 @@ refresh_id="$("${AWS[@]}" autoscaling start-instance-refresh \
     --query InstanceRefreshId \
     --output text)"
 
-[[ -n "$refresh_id" && "$refresh_id" != None ]] || {
-    echo "ERROR: AWS did not return a refresh ID." >&2
+[[ -n "$refresh_id" && "$refresh_id" != "None" ]] || {
+    echo "ERROR: AWS did not return an Instance Refresh ID." >&2
     exit 1
 }
 
-printf '%s\n' "$refresh_id" > "$ROOT_DIR/artifacts/latest-refresh-id.txt"
-printf '%s\n' "$expected_version" > "$ROOT_DIR/artifacts/refresh-lt-version.txt"
-printf '%s\n' "$expected_ami" > "$ROOT_DIR/artifacts/refresh-ami-id.txt"
+printf '%s\n' "$refresh_id" > "$ARTIFACT_DIR/latest-refresh-id.txt"
+printf '%s\n' "$expected_version" > "$ARTIFACT_DIR/refresh-lt-version.txt"
+printf '%s\n' "$expected_ami" > "$ARTIFACT_DIR/refresh-ami-id.txt"
 
-echo "Instance Refresh started: $refresh_id"
+echo "SUCCESS: Instance Refresh started."
+echo "Refresh ID: $refresh_id"
+echo "Next: scripts/06-verify-refresh.sh"

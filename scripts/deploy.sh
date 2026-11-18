@@ -4,6 +4,10 @@ set -Eeuo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
+# --------------------------------------------------
+# Validate configuration
+# --------------------------------------------------
+
 for v in SOURCE_INSTANCE_ID LAUNCH_TEMPLATE_ID ASG_NAME TARGET_GROUP_ARN APP_BUILD_NUMBER APP_GIT_COMMIT; do
     require_value "$v"
 done
@@ -21,14 +25,16 @@ validate_refresh_settings
 }
 
 ARTIFACT_DIR="$(artifact_dir)"
-COMMIT_SHORT="${APP_GIT_COMMIT:0:7}"
 AMI_NAME="${AMI_NAME_PREFIX}-${APP_BUILD_NUMBER}"
 
-# Validate source instance.
-source_json="$("${AWS[@]}" ec2 describe-instances \
-    --instance-ids "$SOURCE_INSTANCE_ID" --output json)"
+# --------------------------------------------------
+# Validate source instance and ASG
+# --------------------------------------------------
 
-source_state="$(jq -r '.Reservations[0].Instances[0].State.Name // empty' <<< "$source_json")"
+source_state="$("${AWS[@]}" ec2 describe-instances \
+    --instance-ids "$SOURCE_INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].State.Name' \
+    --output text)"
 
 [[ "$source_state" == running ]] || {
     echo "ERROR: Source instance is not running." >&2
@@ -46,7 +52,6 @@ source_target="$("${AWS[@]}" elbv2 describe-target-health \
     exit 1
 }
 
-# Validate ASG and Launch Template.
 asg_json="$(get_asg_json "$ASG_NAME")"
 
 [[ "$(jq '.AutoScalingGroups | length' <<< "$asg_json")" == 1 ]] || {
@@ -81,22 +86,30 @@ attached="$(jq --arg tg "$TARGET_GROUP_ARN" \
 
 assert_no_active_refresh
 
-current_configured="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' <<< "$asg_json")"
-PREVIOUS_ASG_VERSION="$(resolve_asg_version "$current_configured")"
+CURRENT_ASG_VERSION="$(jq -r '.AutoScalingGroups[0].LaunchTemplate.Version // empty' <<< "$asg_json")"
 
-[[ "$PREVIOUS_ASG_VERSION" =~ ^[0-9]+$ ]] || {
-    echo "ERROR: Could not resolve ASG Launch Template version." >&2
+LATEST_LT_VERSION="$("${AWS[@]}" ec2 describe-launch-template-versions \
+    --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+    --versions '$Latest' \
+    --query 'LaunchTemplateVersions[0].VersionNumber' \
+    --output text)"
+
+[[ "$LATEST_LT_VERSION" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: Could not determine latest Launch Template version." >&2
     exit 1
 }
 
-echo "Preflight passed: build #${APP_BUILD_NUMBER}, ASG ${ASG_NAME}, LT version ${PREVIOUS_ASG_VERSION}."
+echo "Preflight passed: build #${APP_BUILD_NUMBER}, ASG ${ASG_NAME}, latest LT version ${LATEST_LT_VERSION}."
 
 if [[ "$APPLY" != true ]]; then
     echo "DRY RUN: no AWS changes made."
     exit 0
 fi
 
-# Find or create the AMI for this application build.
+# --------------------------------------------------
+# Create or reuse AMI
+# --------------------------------------------------
+
 existing_amis="$("${AWS[@]}" ec2 describe-images \
     --owners self \
     --filters "Name=name,Values=${AMI_NAME}" \
@@ -161,18 +174,20 @@ else
 
     [[ "$NO_REBOOT" == true ]] && ami_args+=(--no-reboot)
 
-    AMI_ID="$("${AWS[@]}" "${ami_args[@]}" --query ImageId --output text)"
+    AMI_ID="$("${AWS[@]}" "${ami_args[@]}" \
+        --query ImageId --output text)"
 
     [[ "$AMI_ID" == ami-* ]] || {
         echo "ERROR: AMI creation failed." >&2
         exit 1
     }
-
-    echo "Waiting for AMI availability..."
-    "${AWS[@]}" ec2 wait image-available --image-ids "$AMI_ID"
 fi
 
-ami_json="$("${AWS[@]}" ec2 describe-images --image-ids "$AMI_ID" --output json)"
+echo "Waiting for AMI availability..."
+"${AWS[@]}" ec2 wait image-available --image-ids "$AMI_ID"
+
+ami_json="$("${AWS[@]}" ec2 describe-images \
+    --image-ids "$AMI_ID" --output json)"
 
 [[ "$(jq -r '.Images[0].State' <<< "$ami_json")" == available ]] || {
     echo "ERROR: AMI is not available." >&2
@@ -182,10 +197,12 @@ ami_json="$("${AWS[@]}" ec2 describe-images --image-ids "$AMI_ID" --output json)
 printf '%s\n' "$AMI_ID" > "$ARTIFACT_DIR/latest-ami-id.txt"
 printf '%s\n' "$AMI_NAME" > "$ARTIFACT_DIR/latest-ami-name.txt"
 
-# Reuse a matching LT version if this build was already processed.
+# --------------------------------------------------
+# Find or create Launch Template version
+# --------------------------------------------------
+
 all_versions="$("${AWS[@]}" ec2 describe-launch-template-versions \
     --launch-template-id "$LAUNCH_TEMPLATE_ID" \
-    --versions '$All' \
     --output json)"
 
 NEW_LT_VERSION="$(jq -r --arg ami "$AMI_ID" \
@@ -196,12 +213,11 @@ NEW_LT_VERSION="$(jq -r --arg ami "$AMI_ID" \
 if [[ -n "$NEW_LT_VERSION" ]]; then
     echo "Reusing Launch Template version: ${NEW_LT_VERSION}"
 else
-    # Inherit the ASG's configured version, not $Latest.
     lt_data="$ARTIFACT_DIR/launch-template-data.json"
 
     "${AWS[@]}" ec2 describe-launch-template-versions \
         --launch-template-id "$LAUNCH_TEMPLATE_ID" \
-        --versions "$PREVIOUS_ASG_VERSION" \
+        --versions '$Latest' \
         --query 'LaunchTemplateVersions[0].LaunchTemplateData' \
         --output json > "$lt_data"
 
@@ -212,7 +228,7 @@ else
 
     NEW_LT_VERSION="$("${AWS[@]}" ec2 create-launch-template-version \
         --launch-template-id "$LAUNCH_TEMPLATE_ID" \
-        --source-version "$PREVIOUS_ASG_VERSION" \
+        --source-version '$Latest' \
         --version-description "app-build-${APP_BUILD_NUMBER}" \
         --launch-template-data "file://$lt_data" \
         --query 'LaunchTemplateVersion.VersionNumber' \
@@ -235,15 +251,17 @@ new_lt_ami="$("${AWS[@]}" ec2 describe-launch-template-versions \
     exit 1
 }
 
-printf '%s\n' "$PREVIOUS_ASG_VERSION" > "$ARTIFACT_DIR/previous-asg-lt-version.txt"
+printf '%s\n' "$CURRENT_ASG_VERSION" > "$ARTIFACT_DIR/previous-asg-lt-version.txt"
 printf '%s\n' "$NEW_LT_VERSION" > "$ARTIFACT_DIR/latest-lt-version.txt"
 printf '%s\n' "$AMI_ID" > "$ARTIFACT_DIR/refresh-ami-id.txt"
 printf '%s\n' "$NEW_LT_VERSION" > "$ARTIFACT_DIR/refresh-lt-version.txt"
 
-# If ASG already uses this version, do not start another refresh.
-if [[ "$PREVIOUS_ASG_VERSION" == "$NEW_LT_VERSION" ]]; then
-    echo "ASG already uses the required Launch Template version."
+# --------------------------------------------------
+# Update ASG and refresh
+# --------------------------------------------------
 
+if [[ "$CURRENT_ASG_VERSION" == "$NEW_LT_VERSION" ]]; then
+    echo "ASG already uses the required Launch Template version."
     verify_asg_instances "$NEW_LT_VERSION" "$AMI_ID"
 else
     "${AWS[@]}" autoscaling update-auto-scaling-group \
@@ -284,6 +302,10 @@ else
     verify_asg_instances "$NEW_LT_VERSION" "$AMI_ID"
 fi
 
+# --------------------------------------------------
+# Save deployment metadata
+# --------------------------------------------------
+
 cat > "$ARTIFACT_DIR/deployment-metadata.txt" <<META
 APP_NAME=$APP_NAME
 APP_BUILD_NUMBER=$APP_BUILD_NUMBER
@@ -291,7 +313,7 @@ APP_GIT_COMMIT=$APP_GIT_COMMIT
 AMI_ID=$AMI_ID
 AMI_NAME=$AMI_NAME
 LAUNCH_TEMPLATE_ID=$LAUNCH_TEMPLATE_ID
-PREVIOUS_ASG_LT_VERSION=$PREVIOUS_ASG_VERSION
+PREVIOUS_ASG_LT_VERSION=$CURRENT_ASG_VERSION
 NEW_ASG_LT_VERSION=$NEW_LT_VERSION
 META
 
